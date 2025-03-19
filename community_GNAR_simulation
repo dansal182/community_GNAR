@@ -1,0 +1,162 @@
+sim_time_step_community_tv_weights <- function(stages_tensor, weight_matrix_list, max_lag, alpha_vec, beta_vec, gamma_vec, covariate_group, current_cov, lags_data) {
+  d = ncol(weight_matrix)
+  if(max_lag > 1) {
+    cov_lags = t(vapply(seq(1:max_lag), function(x) {return(covariate_group * lags_data[x, ])}, rep(0, d)))
+  } else {
+    cov_lags = matrix(covariate_group * lags_data[1, ], nrow = 1, ncol = d)
+  }
+  out = rep(0, d)
+  for(k in 1:max_lag) {
+    within_community_term = vapply(seq(1:length(beta_vec[[k]])), function(x) {(weight_matrix_list[[time_step]][[current_cov]] * stages_tensor[[r]]) %*% cov_lags[k, ]},
+                                       rep(0, d))
+    between_community_term = 
+    out = out + alpha_vec[k] * cov_lags[k, ] + neighbourhood_term
+  }
+  return(as.numeric(out))
+}
+
+community_GNARsim <- function(n_steps, network, alpha_params, beta_params, gamma_params, weight_matrix_list, covariate_groups, interaction_groups, sigma_noise = 1) {
+  # number of communities linked to their respective covariate
+  C = length(covariate_groups) 
+  # r-stage depth order (i.e., furthest neighbours)
+  beta_orders = lapply(seq(1:C), function(x) {get_covariate_beta_order(x, beta_params)}) 
+  r_star = max(vapply(seq(1:C), function(x) {max(beta_orders[[x]])}, 0))
+  # compute the r-stage adjacency matrices
+  stages_tensor = get_k_stages_adjacency_tensor(as.matrix(GNARtoigraph(network)), r_star) 
+  # compute time-varying weights list
+  Wt_list = community_tv_weight_matrices(weight_matrix_list, covariate_groups) 
+  # compute lag order for each community
+  alpha_order = vapply(seq(1:length(alpha_params)), function(x){length(alpha_params[[x]])}, 0.0) 
+  # largest active lag
+  p_max = max(alpha_order) 
+  # number of variables
+  d = ncol(weight_matrix_list[[1]])
+  # random initialisation
+  X0 = matrix(rnorm(p_max * d, 0, 1), nrow = p_max, ncol = d) 
+  # list of model coefficients
+  theta0_list = lapply(seq(1:C), function(x) {get_community_theta(alpha_params[[x]], beta_params[[x]], gamma_params[[x]])}) 
+  # full model vector of parameters
+  theta_0 = merge_name_blocks(theta0_list)
+  # output matrix initialisation
+  out = matrix(rep(0, n_steps * d), nrow = n_steps, ncol = d) 
+  # set the random initialisation at the top
+  out = rbind(X0, out) 
+  # Loop all simulated steps
+  # Each iteration builds the design matrix and computes the next step as an observation with additive noise for the d-dimensional linear model (i.e., the longitudinal form)
+  for (t in (p_max + 1):(n_steps + p_max)) {
+    # grab the predictors (i.e., the lagged observations)
+    autoregressive_rows = seq(t - p_max, t - 1, 1)
+    # select the community-wise vectors
+    community_blocks = get_covariate_data_blocks(out[autoregressive_rows, ], covariate_groups)
+    # print(community_blocks)
+    # compute the community designs
+    community_designs <- lapply(seq(1:C), function(x) {build_community_design_time_step(t, stages_tensor, alpha_order[x], p_max,
+                                                                                                  beta_orders[[x]],
+                                                                                                  Wt_list, community_blocks, x, 
+                                                                                                  interaction_groups[[x]])})
+    # merge the design matrices for each community, i.e., stack the columns in ascending order with respect to community                                                                                          
+    time_step_design = merge_community_time_step_designs(community_designs)
+    # print(time_step_design)
+    # compute the new time-step using the longitudinal form
+    out[t, ] = c(time_step_design %*% theta_0) + rnorm(d, 0, sigma_noise)
+    # print(out[t, ])
+  }
+  # Name each of the columns as X[t,d]
+  colnames(out) <- vapply(seq(1:d), function(x) {paste0("X", as.character(x))}, "")
+  return(out[(1 + p_max):(n_steps + p_max), ])
+}
+
+get_covariate_beta_order <- function(current_covariate, beta_params) {
+  beta_params_current_covariate = beta_params[[current_covariate]]
+  covariate_lags = length(beta_params_current_covariate)
+  beta_orders_current_covariate = vapply(seq(1:covariate_lags), function(x) {length(beta_params_current_covariate[[x]])}, 0)
+  return(beta_orders_current_covariate)
+}
+
+get_community_parameter_number <- function(community_alpha_order, community_beta_orders, interaction_covariates) {
+  if (missing(interaction_covariates)) {
+    interaction_size = 0
+  } else if (interaction_covariates[1] == 0) {
+    interaction_size = 0
+  } else {
+    interaction_size = length(interaction_covariates)
+  }
+  community_parameter_number = community_alpha_order + (1 + interaction_size) * sum(community_beta_orders)
+  return (community_parameter_number) 
+}
+
+get_community_theta <- function(commnuity_alpha_params, community_beta_params, community_gamma_params) {
+  p_lag = length(commnuity_alpha_params)
+  if (is.na(community_gamma_params[1])) {
+    community_theta_list = lapply(seq(1:p_lag), function(x) {get_community_kth_lag_vector(x, commnuity_alpha_params, community_beta_params, community_gamma_params, FALSE)})
+  } else {
+    community_theta_list = lapply(seq(1:p_lag), function(x) {get_community_kth_lag_vector(x, commnuity_alpha_params, community_beta_params, community_gamma_params)})
+  }
+  theta_community = merge_name_blocks(community_theta_list)
+  return (theta_community)
+}
+
+get_community_kth_lag_vector <- function(k_lag, commnuity_alpha_params, community_beta_params, community_gamma_params, interactions = TRUE) {
+  alpha_k = commnuity_alpha_params[k_lag]
+  beta_k_vec = community_beta_params[[k_lag]]
+  if (interactions) {
+    gamma_k_vec = community_gamma_params[[k_lag]]
+    theta_k = c(alpha_k, beta_k_vec, gamma_k_vec)
+  } else {
+    theta_k = c(alpha_k, beta_k_vec)
+  }
+  return (theta_k)
+}
+
+build_community_design_time_step <- function(time_step, stages_tensor, p_lag, p_max, r_stages, Wt_list, covariate_data_blocks, current_covariate, interaction_covariates) {
+  vts_data = covariate_data_blocks[[current_covariate]]
+  t = time_step
+  if (missing(interaction_covariates)) {
+    cat("Warning: no interactions specified returning no interactions.")
+    # how to select all other covariates 
+    # interaction_covariates = c(1:num_covariates)[c(1:num_covariates) != current_covariate]
+    vts_interaction = NULL
+  } else if (interaction_covariates[1] == 0) {
+    vts_interaction = NULL
+    # col_names <- c('yvec', get_cov_block_coefficient_names(p_lag, r_stages, current_covariate))
+  } else {
+    vts_interaction = covariate_data_blocks[interaction_covariates]
+    # col_names <- c('yvec', get_cov_interaction_block_coefficient_names(p_lag, r_stages, current_covariate, interaction_covariates))
+  }
+  dmat = get_interactions_time_step_dmat(stages_tensor, p_lag, p_max + 1, r_stages, Wt_list[[t - p_max]][[current_covariate]], vts_data, vts_interaction)
+  return (dmat)
+}
+
+normalise_theta <- function(theta_c, delta) {
+  l1_norm_upp_bound = (1 + delta) * sum(abs(theta_c))
+  normalising_constant = 1 / l1_norm_upp_bound
+  return (normalising_constant * theta_c)
+}
+
+stationary_theta_sim <- function(alpha_orders, beta_orders, interaction_covariates, delta_vec) {
+  C = length(alpha_orders)
+  q_vec = vapply(seq(1:C), function(x) {get_community_parameter_number(alpha_orders[x], beta_orders[[x]], interaction_covariates[[x]])}, 0.0)
+  # print(q_vec)
+  theta0_list = lapply(seq(1:C), function(x) {normalise_theta(rnorm(q_vec[x]), delta_vec[x])})
+  theta0 = merge_name_blocks(theta0_list)
+  return (theta0)
+}
+
+
+merge_community_time_step_designs <- function(covariate_models) {
+  if (length(covariate_models) == 1) {
+    return (covariate_models[[1]])
+  } else {
+    n_dmats = length(covariate_models)
+    mid_point = n_dmats %/% 2
+    left_split = merge_community_time_step_designs(covariate_models[1:mid_point])
+    right_split = merge_community_time_step_designs(covariate_models[(mid_point + 1):n_dmats])
+    return(cbind(left_split, right_split))
+  }
+}
+
+#merge_community_time_step_models <- function(mod0, mod1) {
+#  yvec = mod0[, 1] + mod1[, 1]
+#  dmat = cbind(mod0[, 2:ncol(mod0)], mod1[, 2:ncol(mod1)])
+#  return(cbind(yvec, dmat))
+#}
